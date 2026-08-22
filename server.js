@@ -32,8 +32,11 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 app.use('/uploads', express.static(uploadDir));
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const cleanFileName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    cb(null, `${Date.now()}-${cleanFileName}`);
+  }
 });
 const upload = multer({ storage });
 
@@ -157,13 +160,13 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = ?`,
         [dealerId]
       );
-      totalWorkSum = parseFloat(workRows[0].total_work) || 0;
-      totalPaidSum = parseFloat(payRows[0].total_paid) || 0;
+      totalWorkSum = parseFloat(workRows[0]?.total_work) || 0;
+      totalPaidSum = parseFloat(payRows[0]?.total_paid) || 0;
     } else {
       const [workRows] = await pool.query(`SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases`);
       const [payRows] = await pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments`);
-      totalWorkSum = parseFloat(workRows[0].total_work) || 0;
-      totalPaidSum = parseFloat(payRows[0].total_paid) || 0;
+      totalWorkSum = parseFloat(workRows[0]?.total_work) || 0;
+      totalPaidSum = parseFloat(payRows[0]?.total_paid) || 0;
     }
 
     const counts = { NEW_CASES: 0, IN_PROGRESS: 0, SENT_TO_RTO: 0, RC_UPDATED: 0, COMPLETED: 0 };
@@ -181,7 +184,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 4. CASES CRUD & EDGE CASES
+// 4. CASES CRUD
 // ==========================================
 app.get('/api/cases', authenticateToken, async (req, res) => {
   try {
@@ -234,11 +237,72 @@ app.post('/api/cases', authenticateToken, async (req, res) => {
     const [result] = await pool.query(
       `INSERT INTO cases (dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee, status) 
        VALUES (?, ?, ?, ?, ?, ?, 'NEW_CASES')`,
-      [dealer_id, vehicle_no, customer_name.trim(), service_type, parseFloat(govt_fee) || 0, parseFloat(agent_fee) || 1500]
+      [dealer_id, vehicle_no, customer_name.trim(), service_type, parseFloat(govt_fee) || 0, parseFloat(agent_fee) || 0]
     );
 
     const [createdCase] = await pool.query('SELECT * FROM cases WHERE case_id = ?', [result.insertId]);
     res.status(201).json(createdCase[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update / Edit Full Case
+app.put('/api/cases/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let { vehicle_no, customer_name, service_type, govt_fee, agent_fee, status, error_reason } = req.body;
+
+    if (!vehicle_no || !customer_name) {
+      return res.status(400).json({ error: 'Vehicle number and customer name are required.' });
+    }
+
+    vehicle_no = vehicle_no.replace(/\s+/g, '').toUpperCase();
+
+    const [result] = await pool.query(
+      `UPDATE cases SET 
+        vehicle_no = ?, 
+        customer_name = ?, 
+        service_type = ?, 
+        govt_fee = ?, 
+        agent_fee = ?, 
+        status = ?, 
+        error_reason = ? 
+       WHERE case_id = ?`,
+      [
+        vehicle_no,
+        customer_name.trim(),
+        service_type,
+        parseFloat(govt_fee) || 0,
+        parseFloat(agent_fee) || 0,
+        status || 'NEW_CASES',
+        status === 'IN_PROGRESS' ? (error_reason || '').trim() : null,
+        id
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+
+    const [updatedCase] = await pool.query('SELECT * FROM cases WHERE case_id = ?', [id]);
+    res.json(updatedCase[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete Case
+app.delete('/api/cases/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [result] = await pool.query('DELETE FROM cases WHERE case_id = ?', [id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+
+    res.json({ success: true, message: 'Case deleted successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -270,6 +334,9 @@ app.patch('/api/cases/:id/status', authenticateToken, async (req, res) => {
 app.post('/api/cases/:id/upload-rc', authenticateToken, upload.single('rc_file'), async (req, res) => {
   try {
     const { id } = req.params;
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
     const fileUrl = `/uploads/${req.file.filename}`;
     await pool.query(`UPDATE cases SET rc_file_url = ?, status = 'RC_UPDATED' WHERE case_id = ?`, [fileUrl, id]);
     const [updatedCase] = await pool.query('SELECT * FROM cases WHERE case_id = ?', [id]);
@@ -291,14 +358,14 @@ app.get('/api/dealers', authenticateToken, async (req, res) => {
   }
 });
 
+// Create Dealer (Without Mandatory Agent Fee)
 app.post('/api/dealers', authenticateToken, async (req, res) => {
   try {
-    const { name, phone, default_rate } = req.body;
-    if (!name || !phone) return res.status(400).json({ error: 'Dealer name and phone required.' });
+    const { name, phone } = req.body;
+    if (!name || !phone) return res.status(400).json({ error: 'Dealer name and phone are required.' });
 
     const cleanPhone = phone.replace(/\D/g, '').trim();
 
-    // Guard: Prevent duplicate dealer with the exact same phone number
     const [existing] = await pool.query('SELECT * FROM dealers WHERE phone = ?', [cleanPhone]);
     if (existing.length > 0) {
       return res.status(400).json({ 
@@ -307,8 +374,8 @@ app.post('/api/dealers', authenticateToken, async (req, res) => {
     }
 
     const [result] = await pool.query(
-      `INSERT INTO dealers (name, phone, default_rate) VALUES (?, ?, ?)`,
-      [name.trim(), cleanPhone, parseFloat(default_rate) || 1500]
+      `INSERT INTO dealers (name, phone, default_rate) VALUES (?, ?, 0)`,
+      [name.trim(), cleanPhone]
     );
 
     const [newDealer] = await pool.query('SELECT * FROM dealers WHERE dealer_id = ?', [result.insertId]);
@@ -354,8 +421,8 @@ app.get('/api/dealers/:id/khata', authenticateToken, async (req, res) => {
       [dealerId]
     );
 
-    const totalWork = parseFloat(workRows[0].total_work) || 0;
-    const totalPaid = parseFloat(payRows[0].total_paid) || 0;
+    const totalWork = parseFloat(workRows[0]?.total_work) || 0;
+    const totalPaid = parseFloat(payRows[0]?.total_paid) || 0;
 
     res.json({
       payments,
@@ -375,7 +442,6 @@ app.post('/api/payments', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Please enter a valid payment amount' });
     }
 
-    // Guard: Prevent recording exact duplicate payments within 5 seconds for same dealer & amount
     const [recentPayments] = await pool.query(
       `SELECT * FROM dealer_payments 
        WHERE dealer_id = ? AND amount = ? AND created_at >= (NOW() - INTERVAL 5 SECOND)`,
@@ -401,5 +467,5 @@ app.post('/api/payments', authenticateToken, async (req, res) => {
 // ==========================================
 // 6. SERVER INITIALIZATION
 // ==========================================
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend (MySQL) listening on port ${PORT}`));
+const PORT = process.env.PORT || 5001;
+app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend (MySQL) running on port ${PORT}`));
