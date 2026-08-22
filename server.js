@@ -34,8 +34,12 @@ app.use('/uploads', express.static(uploadDir));
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
-    const cleanFileName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    cb(null, `${Date.now()}-${cleanFileName}`);
+    // Sanitize extension and base name properly
+    const ext = path.extname(file.originalname).replace(/[^a-zA-Z0-9]/g, '');
+    const nameWithoutExt = path.basename(file.originalname, path.extname(file.originalname))
+      .replace(/[^a-zA-Z0-9_-]/g, '_');
+    
+    cb(null, `${Date.now()}-${nameWithoutExt}.${ext || 'pdf'}`);
   }
 });
 const upload = multer({ storage });
