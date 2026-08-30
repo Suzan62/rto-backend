@@ -9,14 +9,14 @@ const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
 const app = express();
-// const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-// Replace your current pool declaration with this:
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('localhost') 
     ? { rejectUnauthorized: false } 
     : false
 });
+
 const JWT_SECRET = process.env.JWT_SECRET || 'rto_secret_key_2026';
 
 app.use(cors());
@@ -69,9 +69,8 @@ app.post('/api/auth/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Check plain-text match first; if false, test bcrypt hash
     let isPasswordValid = (password === user.password_hash);
-    if (!isPasswordValid && user.password_hash.startsWith('$2')) {
+    if (!isPasswordValid && user.password_hash && user.password_hash.startsWith('$2')) {
       isPasswordValid = await bcrypt.compare(password, user.password_hash).catch(() => false);
     }
 
@@ -100,7 +99,6 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Change Password Endpoint
 app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   try {
     const { oldPassword, newPassword } = req.body;
@@ -131,7 +129,7 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 3. DASHBOARD & DEALER METRICS
+// 3. DASHBOARD METRICS
 // ==========================================
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
@@ -150,7 +148,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 
     const statsRes = await pool.query(statsQuery, params);
 
-    // Calculate dynamic ledger balance: (Total Billed/Unbilled Cases - Total Paid Payments)
     let totalWorkSum = 0;
     let totalPaidSum = 0;
 
@@ -173,7 +170,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     }
 
     const remainingKhataBalance = Math.max(0, totalWorkSum - totalPaidSum);
-
     const counts = { NEW_CASES: 0, IN_PROGRESS: 0, SENT_TO_RTO: 0, RC_UPDATED: 0, COMPLETED: 0 };
     statsRes.rows.forEach(r => { counts[r.status] = parseInt(r.count, 10); });
 
@@ -189,7 +185,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 4. CASES CRUD
+// 4. CASES CRUD & EDGE CASES
 // ==========================================
 app.get('/api/cases', authenticateToken, async (req, res) => {
   try {
@@ -221,13 +217,33 @@ app.get('/api/cases', authenticateToken, async (req, res) => {
 
 app.post('/api/cases', authenticateToken, async (req, res) => {
   try {
-    const { dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee } = req.body;
+    let { dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee } = req.body;
+
+    if (!dealer_id || !vehicle_no || !customer_name) {
+      return res.status(400).json({ error: 'Dealer, vehicle number, and customer name are required.' });
+    }
+
+    vehicle_no = vehicle_no.replace(/\s+/g, '').toUpperCase();
+
+    const duplicateCheck = await pool.query(
+      `SELECT case_id FROM cases 
+       WHERE vehicle_no = $1 AND status NOT IN ('COMPLETED', 'REJECTED')`,
+      [vehicle_no]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      return res.status(400).json({ 
+        error: `An active case for vehicle ${vehicle_no} is already open (Case #${duplicateCheck.rows[0].case_id}).` 
+      });
+    }
+
     const result = await pool.query(
       `INSERT INTO cases (dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee, status) 
        VALUES ($1, $2, $3, $4, $5, $6, 'NEW_CASES') RETURNING *`,
-      [dealer_id, vehicle_no.toUpperCase(), customer_name, service_type, govt_fee || 0, agent_fee || 1500]
+      [dealer_id, vehicle_no, customer_name.trim(), service_type, parseFloat(govt_fee) || 0, parseFloat(agent_fee) || 1500]
     );
-    res.json(result.rows[0]);
+
+    res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -237,10 +253,25 @@ app.patch('/api/cases/:id/status', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { status, error_reason } = req.body;
+
+    if (status === 'IN_PROGRESS' && (!error_reason || !error_reason.trim())) {
+      return res.status(400).json({ error: 'Please specify the objection or document issue reason.' });
+    }
+
+    const updatedReason = status === 'IN_PROGRESS' ? error_reason.trim() : null;
+
     const result = await pool.query(
-      `UPDATE cases SET status = $1, error_reason = $2 WHERE case_id = $3 RETURNING *`,
-      [status, error_reason || null, id]
+      `UPDATE cases 
+       SET status = $1, error_reason = $2 
+       WHERE case_id = $3 
+       RETURNING *`,
+      [status, updatedReason, id]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -273,90 +304,18 @@ app.get('/api/dealers', authenticateToken, async (req, res) => {
   }
 });
 
-// Get detailed Khata Ledger for a dealer (Payments list + Totals)
-app.get('/api/dealers/:id/khata', authenticateToken, async (req, res) => {
+// CREATE NEW DEALER
+app.post('/api/dealers', authenticateToken, async (req, res) => {
   try {
-    const dealerId = req.params.id;
-    const paymentsRes = await pool.query(
-      `SELECT * FROM dealer_payments WHERE dealer_id = $1 ORDER BY created_at DESC`,
-      [dealerId]
-    );
-    const workRes = await pool.query(
-      `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = $1`,
-      [dealerId]
-    );
-    const paidRes = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = $1`,
-      [dealerId]
-    );
-
-    const totalWork = parseFloat(workRes.rows[0].total_work);
-    const totalPaid = parseFloat(paidRes.rows[0].total_paid);
-
-    res.json({
-      payments: paymentsRes.rows,
-      totalWork,
-      totalPaid,
-      balanceDue: Math.max(0, totalWork - totalPaid)
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Record a Payment (Partial / Full payment credit)
-app.post('/api/payments', authenticateToken, async (req, res) => {
-  try {
-    const { dealer_id, amount, payment_mode, notes } = req.body;
-    if (!amount || parseFloat(amount) <= 0) {
-      return res.status(400).json({ error: 'Please enter a valid payment amount' });
+    const { name, phone, default_rate } = req.body;
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'Dealer name and phone number are required.' });
     }
 
     const result = await pool.query(
-      `INSERT INTO dealer_payments (dealer_id, amount, payment_mode, notes) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [dealer_id, amount, payment_mode || 'CASH', notes || '']
-    );
-
-    res.json({ success: true, payment: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend listening on port ${PORT}`));
-// ==========================================
-// 1. ADD NEW CASE WITH EDGE-CASE GUARDS
-// ==========================================
-app.post('/api/cases', authenticateToken, async (req, res) => {
-  try {
-    let { dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee } = req.body;
-
-    if (!dealer_id || !vehicle_no || !customer_name) {
-      return res.status(400).json({ error: 'Dealer, vehicle number, and customer name are required.' });
-    }
-
-    // Edge Case: Normalize and sanitize vehicle number
-    vehicle_no = vehicle_no.replace(/\s+/g, '').toUpperCase();
-
-    // Edge Case: Check for active open duplicate case for the same vehicle
-    const duplicateCheck = await pool.query(
-      `SELECT case_id FROM cases 
-       WHERE vehicle_no = $1 AND status NOT IN ('COMPLETED', 'REJECTED')`,
-      [vehicle_no]
-    );
-
-    if (duplicateCheck.rows.length > 0) {
-      return res.status(400).json({ 
-        error: `An active case for vehicle ${vehicle_no} is already open (Case #${duplicateCheck.rows[0].case_id}).` 
-      });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO cases (dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee, status) 
-       VALUES ($1, $2, $3, $4, $5, $6, 'NEW_CASES') RETURNING *`,
-      [dealer_id, vehicle_no, customer_name.trim(), service_type, parseFloat(govt_fee) || 0, parseFloat(agent_fee) || 1500]
+      `INSERT INTO dealers (name, phone, default_rate) 
+       VALUES ($1, $2, $3) RETURNING *`,
+      [name.trim(), phone.trim(), parseFloat(default_rate) || 1500]
     );
 
     res.status(201).json(result.rows[0]);
@@ -365,52 +324,14 @@ app.post('/api/cases', authenticateToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// 2. STATUS & DETAILED OBJECTION HANDLER
-// ==========================================
-app.patch('/api/cases/:id/status', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status, error_reason } = req.body;
-
-    // Edge Case: If status is flagged as IN_PROGRESS/Objection, ensure reason is provided
-    if (status === 'IN_PROGRESS' && (!error_reason || !error_reason.trim())) {
-      return res.status(400).json({ error: 'Please specify the objection or document issue reason.' });
-    }
-
-    // If advancing case to SENT_TO_RTO or COMPLETED, clear the previous objection note
-    const updatedReason = status === 'IN_PROGRESS' ? error_reason.trim() : null;
-
-    const result = await pool.query(
-      `UPDATE cases 
-       SET status = $1, error_reason = $2 
-       WHERE case_id = $3 
-       RETURNING *`,
-      [status, updatedReason, id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Case not found' });
-    }
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ==========================================
-// 3. SAFE DEALER DELETION GUARD (EDGE CASE)
-// ==========================================
+// SAFE DEALER DELETION
 app.delete('/api/dealers/:id', authenticateToken, async (req, res) => {
   try {
     const dealerId = req.params.id;
-
     if (req.user.role !== 'ADMIN') {
       return res.status(403).json({ error: 'Only admins can remove dealers.' });
     }
 
-    // Guard 1: Check for active unresolved cases
     const activeCases = await pool.query(
       `SELECT COUNT(*) FROM cases WHERE dealer_id = $1 AND status != 'COMPLETED'`,
       [dealerId]
@@ -418,11 +339,10 @@ app.delete('/api/dealers/:id', authenticateToken, async (req, res) => {
 
     if (parseInt(activeCases.rows[0].count, 10) > 0) {
       return res.status(400).json({ 
-        error: `Cannot delete dealer: ${activeCases.rows[0].count} active/pending cases still exist.` 
+        error: `Cannot delete dealer: ${activeCases.rows[0].count} active cases exist.` 
       });
     }
 
-    // Guard 2: Check for unpaid Khata ledger balance
     const workRes = await pool.query(
       `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = $1`,
       [dealerId]
@@ -445,3 +365,60 @@ app.delete('/api/dealers/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// KHATA LEDGER
+app.get('/api/dealers/:id/khata', authenticateToken, async (req, res) => {
+  try {
+    const dealerId = req.params.id;
+    const paymentsRes = await pool.query(
+      `SELECT * FROM dealer_payments WHERE dealer_id = $1 ORDER BY created_at DESC`,
+      [dealerId]
+    );
+    const workRes = await pool.query(
+      `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = $1`,
+      [dealerId]
+    );
+    const paidRes = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = $1`,
+      [dealerId]
+    );
+
+    const totalWork = parseFloat(workRes.rows[0].total_work);
+    const totalPaid = parseFloat(payRes.rows[0].total_paid);
+
+    res.json({
+      payments: paymentsRes.rows,
+      totalWork,
+      totalPaid,
+      balanceDue: Math.max(0, totalWork - totalPaid)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// RECORD PAYMENT
+app.post('/api/payments', authenticateToken, async (req, res) => {
+  try {
+    const { dealer_id, amount, payment_mode, notes } = req.body;
+    if (!amount || parseFloat(amount) <= 0) {
+      return res.status(400).json({ error: 'Please enter a valid payment amount' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO dealer_payments (dealer_id, amount, payment_mode, notes) 
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [dealer_id, amount, payment_mode || 'CASH', notes || '']
+    );
+
+    res.json({ success: true, payment: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 6. SERVER INITIALIZATION (Must be at bottom)
+// ==========================================
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend listening on port ${PORT}`));
