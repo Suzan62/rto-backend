@@ -367,6 +367,7 @@ app.delete('/api/dealers/:id', authenticateToken, async (req, res) => {
 });
 
 // KHATA LEDGER
+// KHATA LEDGER
 app.get('/api/dealers/:id/khata', authenticateToken, async (req, res) => {
   try {
     const dealerId = req.params.id;
@@ -383,8 +384,8 @@ app.get('/api/dealers/:id/khata', authenticateToken, async (req, res) => {
       [dealerId]
     );
 
-    const totalWork = parseFloat(workRes.rows[0].total_work);
-    const totalPaid = parseFloat(payRes.rows[0].total_paid);
+    const totalWork = parseFloat(workRes.rows[0].total_work) || 0;
+    const totalPaid = parseFloat(paidRes.rows[0].total_paid) || 0;
 
     res.json({
       payments: paymentsRes.rows,
