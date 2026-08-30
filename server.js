@@ -26,7 +26,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'rto_secret_key_2026';
 app.use(cors());
 app.use(express.json());
 
-// Setup uploads folder
+// Setup uploads folder for RC PDFs
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 app.use('/uploads', express.static(uploadDir));
@@ -37,7 +37,9 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// 1. AUTH MIDDLEWARE
+// ==========================================
+// 1. AUTHENTICATION MIDDLEWARE
+// ==========================================
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -51,7 +53,9 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// 2. AUTH & PASSWORD
+// ==========================================
+// 2. AUTH & PASSWORD ROUTES
+// ==========================================
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -121,7 +125,9 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   }
 });
 
+// ==========================================
 // 3. DASHBOARD METRICS
+// ==========================================
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const isDealer = req.user.role === 'DEALER';
@@ -174,7 +180,9 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
-// 4. CASES CRUD
+// ==========================================
+// 4. CASES CRUD & EDGE CASES
+// ==========================================
 app.get('/api/cases', authenticateToken, async (req, res) => {
   try {
     const { status, dealer_id } = req.query;
@@ -212,12 +220,15 @@ app.post('/api/cases', authenticateToken, async (req, res) => {
 
     vehicle_no = vehicle_no.replace(/\s+/g, '').toUpperCase();
 
+    // Guard: Check for open duplicate case on the same vehicle
     const [dup] = await pool.query(
       `SELECT case_id FROM cases WHERE vehicle_no = ? AND status NOT IN ('COMPLETED', 'REJECTED')`,
       [vehicle_no]
     );
     if (dup.length > 0) {
-      return res.status(400).json({ error: `An active case for vehicle ${vehicle_no} is already open.` });
+      return res.status(400).json({ 
+        error: `An active case for vehicle ${vehicle_no} is already open (Case #${dup[0].case_id}).` 
+      });
     }
 
     const [result] = await pool.query(
@@ -268,7 +279,9 @@ app.post('/api/cases/:id/upload-rc', authenticateToken, upload.single('rc_file')
   }
 });
 
-// 5. DEALERS & KHATA
+// ==========================================
+// 5. DEALERS & KHATA / PAYMENT LEDGER
+// ==========================================
 app.get('/api/dealers', authenticateToken, async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM dealers ORDER BY name ASC');
@@ -283,9 +296,19 @@ app.post('/api/dealers', authenticateToken, async (req, res) => {
     const { name, phone, default_rate } = req.body;
     if (!name || !phone) return res.status(400).json({ error: 'Dealer name and phone required.' });
 
+    const cleanPhone = phone.replace(/\D/g, '').trim();
+
+    // Guard: Prevent duplicate dealer with the exact same phone number
+    const [existing] = await pool.query('SELECT * FROM dealers WHERE phone = ?', [cleanPhone]);
+    if (existing.length > 0) {
+      return res.status(400).json({ 
+        error: `Dealer with phone ${cleanPhone} already exists (${existing[0].name}).` 
+      });
+    }
+
     const [result] = await pool.query(
       `INSERT INTO dealers (name, phone, default_rate) VALUES (?, ?, ?)`,
-      [name.trim(), phone.trim(), parseFloat(default_rate) || 1500]
+      [name.trim(), cleanPhone, parseFloat(default_rate) || 1500]
     );
 
     const [newDealer] = await pool.query('SELECT * FROM dealers WHERE dealer_id = ?', [result.insertId]);
@@ -352,9 +375,20 @@ app.post('/api/payments', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Please enter a valid payment amount' });
     }
 
+    // Guard: Prevent recording exact duplicate payments within 5 seconds for same dealer & amount
+    const [recentPayments] = await pool.query(
+      `SELECT * FROM dealer_payments 
+       WHERE dealer_id = ? AND amount = ? AND created_at >= (NOW() - INTERVAL 5 SECOND)`,
+      [dealer_id, parseFloat(amount)]
+    );
+
+    if (recentPayments.length > 0) {
+      return res.status(400).json({ error: 'Duplicate payment detected. Please wait a moment.' });
+    }
+
     const [result] = await pool.query(
       `INSERT INTO dealer_payments (dealer_id, amount, payment_mode, notes) VALUES (?, ?, ?, ?)`,
-      [dealer_id, amount, payment_mode || 'CASH', notes || '']
+      [dealer_id, parseFloat(amount), payment_mode || 'CASH', notes || '']
     );
 
     const [payment] = await pool.query('SELECT * FROM dealer_payments WHERE payment_id = ?', [result.insertId]);
@@ -364,5 +398,8 @@ app.post('/api/payments', authenticateToken, async (req, res) => {
   }
 });
 
+// ==========================================
+// 6. SERVER INITIALIZATION
+// ==========================================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend (MySQL) listening on port ${PORT}`));
