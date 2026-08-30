@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const mysql = require('mysql2/promise');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -10,8 +10,12 @@ require('dotenv').config();
 
 const app = express();
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+// MySQL Connection Pool
+const pool = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
   ssl: process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('localhost') 
     ? { rejectUnauthorized: false } 
     : false
@@ -22,7 +26,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'rto_secret_key_2026';
 app.use(cors());
 app.use(express.json());
 
-// Setup uploads folder for RC PDFs
+// Setup uploads folder
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 app.use('/uploads', express.static(uploadDir));
@@ -33,9 +37,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ==========================================
-// 1. AUTHENTICATION MIDDLEWARE
-// ==========================================
+// 1. AUTH MIDDLEWARE
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -49,34 +51,27 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ==========================================
-// 2. AUTH & PASSWORD ROUTES
-// ==========================================
+// 2. AUTH & PASSWORD
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const result = await pool.query(
-      `SELECT u.*, d.name as dealer_name 
+    const [rows] = await pool.query(
+      `SELECT u.*, d.name AS dealer_name 
        FROM users u 
        LEFT JOIN dealers d ON u.dealer_id = d.dealer_id 
-       WHERE u.username = $1`,
+       WHERE u.username = ?`,
       [username]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid username or password' });
-    }
+    if (rows.length === 0) return res.status(401).json({ error: 'Invalid username or password' });
 
-    const user = result.rows[0];
-
+    const user = rows[0];
     let isPasswordValid = (password === user.password_hash);
     if (!isPasswordValid && user.password_hash && user.password_hash.startsWith('$2')) {
       isPasswordValid = await bcrypt.compare(password, user.password_hash).catch(() => false);
     }
 
-    if (!isPasswordValid) {
-      return res.status(401).json({ error: 'Invalid username or password' });
-    }
+    if (!isPasswordValid) return res.status(401).json({ error: 'Invalid username or password' });
 
     const token = jwt.sign(
       { user_id: user.user_id, username: user.username, role: user.role, dealer_id: user.dealer_id }, 
@@ -108,19 +103,17 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 4 characters long' });
     }
 
-    const userRes = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
-    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const [rows] = await pool.query('SELECT * FROM users WHERE user_id = ?', [userId]);
+    if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
-    const user = userRes.rows[0];
+    const user = rows[0];
     const isOldValid = (oldPassword === user.password_hash) || 
       await bcrypt.compare(oldPassword, user.password_hash).catch(() => false);
 
-    if (!isOldValid) {
-      return res.status(400).json({ error: 'Incorrect current password' });
-    }
+    if (!isOldValid) return res.status(400).json({ error: 'Incorrect current password' });
 
     const newHashed = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [newHashed, userId]);
+    await pool.query('UPDATE users SET password_hash = ? WHERE user_id = ?', [newHashed, userId]);
 
     res.json({ success: true, message: 'Password updated successfully!' });
   } catch (err) {
@@ -128,9 +121,7 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   }
 });
 
-// ==========================================
 // 3. DASHBOARD METRICS
-// ==========================================
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const isDealer = req.user.role === 'DEALER';
@@ -141,40 +132,39 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 
     if (dealerId && dealerId !== 'ALL') {
       params.push(dealerId);
-      statsQuery += ` WHERE dealer_id = $1 GROUP BY status`;
+      statsQuery += ` WHERE dealer_id = ? GROUP BY status`;
     } else {
       statsQuery += ` GROUP BY status`;
     }
 
-    const statsRes = await pool.query(statsQuery, params);
+    const [statsRows] = await pool.query(statsQuery, params);
 
     let totalWorkSum = 0;
     let totalPaidSum = 0;
 
     if (dealerId && dealerId !== 'ALL') {
-      const workRes = await pool.query(
-        `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = $1`,
+      const [workRows] = await pool.query(
+        `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = ?`,
         [dealerId]
       );
-      const payRes = await pool.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = $1`,
+      const [payRows] = await pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = ?`,
         [dealerId]
       );
-      totalWorkSum = parseFloat(workRes.rows[0].total_work);
-      totalPaidSum = parseFloat(payRes.rows[0].total_paid);
+      totalWorkSum = parseFloat(workRows[0].total_work) || 0;
+      totalPaidSum = parseFloat(payRows[0].total_paid) || 0;
     } else {
-      const workRes = await pool.query(`SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases`);
-      const payRes = await pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments`);
-      totalWorkSum = parseFloat(workRes.rows[0].total_work);
-      totalPaidSum = parseFloat(payRes.rows[0].total_paid);
+      const [workRows] = await pool.query(`SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases`);
+      const [payRows] = await pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments`);
+      totalWorkSum = parseFloat(workRows[0].total_work) || 0;
+      totalPaidSum = parseFloat(payRows[0].total_paid) || 0;
     }
 
-    const remainingKhataBalance = Math.max(0, totalWorkSum - totalPaidSum);
     const counts = { NEW_CASES: 0, IN_PROGRESS: 0, SENT_TO_RTO: 0, RC_UPDATED: 0, COMPLETED: 0 };
-    statsRes.rows.forEach(r => { counts[r.status] = parseInt(r.count, 10); });
+    statsRows.forEach(r => { counts[r.status] = parseInt(r.count, 10); });
 
     res.json({
-      unbilledIncome: remainingKhataBalance,
+      unbilledIncome: Math.max(0, totalWorkSum - totalPaidSum),
       totalWork: totalWorkSum,
       totalPaid: totalPaidSum,
       counts
@@ -184,9 +174,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// 4. CASES CRUD & EDGE CASES
-// ==========================================
+// 4. CASES CRUD
 app.get('/api/cases', authenticateToken, async (req, res) => {
   try {
     const { status, dealer_id } = req.query;
@@ -200,16 +188,16 @@ app.get('/api/cases', authenticateToken, async (req, res) => {
 
     if (status && status !== 'ALL') {
       params.push(status);
-      query += ` AND c.status = $${params.length}`;
+      query += ` AND c.status = ?`;
     }
     if (dealer_id) {
       params.push(dealer_id);
-      query += ` AND c.dealer_id = $${params.length}`;
+      query += ` AND c.dealer_id = ?`;
     }
 
     query += ' ORDER BY c.created_at DESC';
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    const [rows] = await pool.query(query, params);
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -218,32 +206,28 @@ app.get('/api/cases', authenticateToken, async (req, res) => {
 app.post('/api/cases', authenticateToken, async (req, res) => {
   try {
     let { dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee } = req.body;
-
     if (!dealer_id || !vehicle_no || !customer_name) {
       return res.status(400).json({ error: 'Dealer, vehicle number, and customer name are required.' });
     }
 
     vehicle_no = vehicle_no.replace(/\s+/g, '').toUpperCase();
 
-    const duplicateCheck = await pool.query(
-      `SELECT case_id FROM cases 
-       WHERE vehicle_no = $1 AND status NOT IN ('COMPLETED', 'REJECTED')`,
+    const [dup] = await pool.query(
+      `SELECT case_id FROM cases WHERE vehicle_no = ? AND status NOT IN ('COMPLETED', 'REJECTED')`,
       [vehicle_no]
     );
-
-    if (duplicateCheck.rows.length > 0) {
-      return res.status(400).json({ 
-        error: `An active case for vehicle ${vehicle_no} is already open (Case #${duplicateCheck.rows[0].case_id}).` 
-      });
+    if (dup.length > 0) {
+      return res.status(400).json({ error: `An active case for vehicle ${vehicle_no} is already open.` });
     }
 
-    const result = await pool.query(
+    const [result] = await pool.query(
       `INSERT INTO cases (dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee, status) 
-       VALUES ($1, $2, $3, $4, $5, $6, 'NEW_CASES') RETURNING *`,
+       VALUES (?, ?, ?, ?, ?, ?, 'NEW_CASES')`,
       [dealer_id, vehicle_no, customer_name.trim(), service_type, parseFloat(govt_fee) || 0, parseFloat(agent_fee) || 1500]
     );
 
-    res.status(201).json(result.rows[0]);
+    const [createdCase] = await pool.query('SELECT * FROM cases WHERE case_id = ?', [result.insertId]);
+    res.status(201).json(createdCase[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -260,19 +244,13 @@ app.patch('/api/cases/:id/status', authenticateToken, async (req, res) => {
 
     const updatedReason = status === 'IN_PROGRESS' ? error_reason.trim() : null;
 
-    const result = await pool.query(
-      `UPDATE cases 
-       SET status = $1, error_reason = $2 
-       WHERE case_id = $3 
-       RETURNING *`,
+    await pool.query(
+      `UPDATE cases SET status = ?, error_reason = ? WHERE case_id = ?`,
       [status, updatedReason, id]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Case not found' });
-    }
-
-    res.json(result.rows[0]);
+    const [updatedCase] = await pool.query('SELECT * FROM cases WHERE case_id = ?', [id]);
+    res.json(updatedCase[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -282,113 +260,82 @@ app.post('/api/cases/:id/upload-rc', authenticateToken, upload.single('rc_file')
   try {
     const { id } = req.params;
     const fileUrl = `/uploads/${req.file.filename}`;
-    const result = await pool.query(
-      `UPDATE cases SET rc_file_url = $1, status = 'RC_UPDATED' WHERE case_id = $2 RETURNING *`,
-      [fileUrl, id]
-    );
-    res.json(result.rows[0]);
+    await pool.query(`UPDATE cases SET rc_file_url = ?, status = 'RC_UPDATED' WHERE case_id = ?`, [fileUrl, id]);
+    const [updatedCase] = await pool.query('SELECT * FROM cases WHERE case_id = ?', [id]);
+    res.json(updatedCase[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ==========================================
-// 5. DEALERS & KHATA / PAYMENT LEDGER
-// ==========================================
+// 5. DEALERS & KHATA
 app.get('/api/dealers', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM dealers ORDER BY name ASC');
-    res.json(result.rows);
+    const [rows] = await pool.query('SELECT * FROM dealers ORDER BY name ASC');
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// CREATE NEW DEALER
 app.post('/api/dealers', authenticateToken, async (req, res) => {
   try {
     const { name, phone, default_rate } = req.body;
-    if (!name || !phone) {
-      return res.status(400).json({ error: 'Dealer name and phone number are required.' });
-    }
+    if (!name || !phone) return res.status(400).json({ error: 'Dealer name and phone required.' });
 
-    const result = await pool.query(
-      `INSERT INTO dealers (name, phone, default_rate) 
-       VALUES ($1, $2, $3) RETURNING *`,
+    const [result] = await pool.query(
+      `INSERT INTO dealers (name, phone, default_rate) VALUES (?, ?, ?)`,
       [name.trim(), phone.trim(), parseFloat(default_rate) || 1500]
     );
 
-    res.status(201).json(result.rows[0]);
+    const [newDealer] = await pool.query('SELECT * FROM dealers WHERE dealer_id = ?', [result.insertId]);
+    res.status(201).json(newDealer[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// SAFE DEALER DELETION
 app.delete('/api/dealers/:id', authenticateToken, async (req, res) => {
   try {
     const dealerId = req.params.id;
-    if (req.user.role !== 'ADMIN') {
-      return res.status(403).json({ error: 'Only admins can remove dealers.' });
-    }
+    if (req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Only admins can delete dealers.' });
 
-    const activeCases = await pool.query(
-      `SELECT COUNT(*) FROM cases WHERE dealer_id = $1 AND status != 'COMPLETED'`,
+    const [activeCases] = await pool.query(
+      `SELECT COUNT(*) as count FROM cases WHERE dealer_id = ? AND status != 'COMPLETED'`,
       [dealerId]
     );
-
-    if (parseInt(activeCases.rows[0].count, 10) > 0) {
-      return res.status(400).json({ 
-        error: `Cannot delete dealer: ${activeCases.rows[0].count} active cases exist.` 
-      });
+    if (parseInt(activeCases[0].count, 10) > 0) {
+      return res.status(400).json({ error: `Cannot delete: ${activeCases[0].count} active cases exist.` });
     }
 
-    const workRes = await pool.query(
-      `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = $1`,
-      [dealerId]
-    );
-    const payRes = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = $1`,
-      [dealerId]
-    );
-
-    const pendingBalance = parseFloat(workRes.rows[0].total_work) - parseFloat(payRes.rows[0].total_paid);
-    if (pendingBalance > 0) {
-      return res.status(400).json({ 
-        error: `Cannot delete dealer: Khata has an unsettled balance of ₹${pendingBalance.toLocaleString()}.` 
-      });
-    }
-
-    await pool.query('DELETE FROM dealers WHERE dealer_id = $1', [dealerId]);
+    await pool.query('DELETE FROM dealers WHERE dealer_id = ?', [dealerId]);
     res.json({ success: true, message: 'Dealer deleted successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// KHATA LEDGER
-// KHATA LEDGER
 app.get('/api/dealers/:id/khata', authenticateToken, async (req, res) => {
   try {
     const dealerId = req.params.id;
-    const paymentsRes = await pool.query(
-      `SELECT * FROM dealer_payments WHERE dealer_id = $1 ORDER BY created_at DESC`,
+    const [payments] = await pool.query(
+      `SELECT * FROM dealer_payments WHERE dealer_id = ? ORDER BY created_at DESC`,
       [dealerId]
     );
-    const workRes = await pool.query(
-      `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = $1`,
+    const [workRows] = await pool.query(
+      `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = ?`,
       [dealerId]
     );
-    const paidRes = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = $1`,
+    const [payRows] = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = ?`,
       [dealerId]
     );
 
-    const totalWork = parseFloat(workRes.rows[0].total_work) || 0;
-    const totalPaid = parseFloat(paidRes.rows[0].total_paid) || 0;
+    const totalWork = parseFloat(workRows[0].total_work) || 0;
+    const totalPaid = parseFloat(payRows[0].total_paid) || 0;
 
     res.json({
-      payments: paymentsRes.rows,
+      payments,
       totalWork,
       totalPaid,
       balanceDue: Math.max(0, totalWork - totalPaid)
@@ -398,7 +345,6 @@ app.get('/api/dealers/:id/khata', authenticateToken, async (req, res) => {
   }
 });
 
-// RECORD PAYMENT
 app.post('/api/payments', authenticateToken, async (req, res) => {
   try {
     const { dealer_id, amount, payment_mode, notes } = req.body;
@@ -406,20 +352,17 @@ app.post('/api/payments', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Please enter a valid payment amount' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO dealer_payments (dealer_id, amount, payment_mode, notes) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
+    const [result] = await pool.query(
+      `INSERT INTO dealer_payments (dealer_id, amount, payment_mode, notes) VALUES (?, ?, ?, ?)`,
       [dealer_id, amount, payment_mode || 'CASH', notes || '']
     );
 
-    res.json({ success: true, payment: result.rows[0] });
+    const [payment] = await pool.query('SELECT * FROM dealer_payments WHERE payment_id = ?', [result.insertId]);
+    res.json({ success: true, payment: payment[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ==========================================
-// 6. SERVER INITIALIZATION (Must be at bottom)
-// ==========================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend listening on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend (MySQL) listening on port ${PORT}`));
