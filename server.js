@@ -326,3 +326,122 @@ app.post('/api/payments', authenticateToken, async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`RTO Backend listening on port ${PORT}`));
+// ==========================================
+// 1. ADD NEW CASE WITH EDGE-CASE GUARDS
+// ==========================================
+app.post('/api/cases', authenticateToken, async (req, res) => {
+  try {
+    let { dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee } = req.body;
+
+    if (!dealer_id || !vehicle_no || !customer_name) {
+      return res.status(400).json({ error: 'Dealer, vehicle number, and customer name are required.' });
+    }
+
+    // Edge Case: Normalize and sanitize vehicle number
+    vehicle_no = vehicle_no.replace(/\s+/g, '').toUpperCase();
+
+    // Edge Case: Check for active open duplicate case for the same vehicle
+    const duplicateCheck = await pool.query(
+      `SELECT case_id FROM cases 
+       WHERE vehicle_no = $1 AND status NOT IN ('COMPLETED', 'REJECTED')`,
+      [vehicle_no]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      return res.status(400).json({ 
+        error: `An active case for vehicle ${vehicle_no} is already open (Case #${duplicateCheck.rows[0].case_id}).` 
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO cases (dealer_id, vehicle_no, customer_name, service_type, govt_fee, agent_fee, status) 
+       VALUES ($1, $2, $3, $4, $5, $6, 'NEW_CASES') RETURNING *`,
+      [dealer_id, vehicle_no, customer_name.trim(), service_type, parseFloat(govt_fee) || 0, parseFloat(agent_fee) || 1500]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 2. STATUS & DETAILED OBJECTION HANDLER
+// ==========================================
+app.patch('/api/cases/:id/status', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, error_reason } = req.body;
+
+    // Edge Case: If status is flagged as IN_PROGRESS/Objection, ensure reason is provided
+    if (status === 'IN_PROGRESS' && (!error_reason || !error_reason.trim())) {
+      return res.status(400).json({ error: 'Please specify the objection or document issue reason.' });
+    }
+
+    // If advancing case to SENT_TO_RTO or COMPLETED, clear the previous objection note
+    const updatedReason = status === 'IN_PROGRESS' ? error_reason.trim() : null;
+
+    const result = await pool.query(
+      `UPDATE cases 
+       SET status = $1, error_reason = $2 
+       WHERE case_id = $3 
+       RETURNING *`,
+      [status, updatedReason, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Case not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 3. SAFE DEALER DELETION GUARD (EDGE CASE)
+// ==========================================
+app.delete('/api/dealers/:id', authenticateToken, async (req, res) => {
+  try {
+    const dealerId = req.params.id;
+
+    if (req.user.role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Only admins can remove dealers.' });
+    }
+
+    // Guard 1: Check for active unresolved cases
+    const activeCases = await pool.query(
+      `SELECT COUNT(*) FROM cases WHERE dealer_id = $1 AND status != 'COMPLETED'`,
+      [dealerId]
+    );
+
+    if (parseInt(activeCases.rows[0].count, 10) > 0) {
+      return res.status(400).json({ 
+        error: `Cannot delete dealer: ${activeCases.rows[0].count} active/pending cases still exist.` 
+      });
+    }
+
+    // Guard 2: Check for unpaid Khata ledger balance
+    const workRes = await pool.query(
+      `SELECT COALESCE(SUM(agent_fee + govt_fee), 0) AS total_work FROM cases WHERE dealer_id = $1`,
+      [dealerId]
+    );
+    const payRes = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM dealer_payments WHERE dealer_id = $1`,
+      [dealerId]
+    );
+
+    const pendingBalance = parseFloat(workRes.rows[0].total_work) - parseFloat(payRes.rows[0].total_paid);
+    if (pendingBalance > 0) {
+      return res.status(400).json({ 
+        error: `Cannot delete dealer: Khata has an unsettled balance of ₹${pendingBalance.toLocaleString()}.` 
+      });
+    }
+
+    await pool.query('DELETE FROM dealers WHERE dealer_id = $1', [dealerId]);
+    res.json({ success: true, message: 'Dealer deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
